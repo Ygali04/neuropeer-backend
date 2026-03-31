@@ -15,6 +15,33 @@ from backend.models.db import Job, Result
 router = APIRouter(tags=["Campaigns"])
 
 
+class AssignRequest(BaseModel):
+    job_id: str
+    user_email: str
+    campaign_name: str | None = None
+
+
+@router.post("/campaigns/assign")
+async def assign_job_to_user(body: AssignRequest) -> dict:
+    """Assign a job to a user's profile and optionally name the campaign."""
+    engine = create_async_engine(settings.database_url)
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with Session() as session:
+        stmt = select(Job).where(Job.id == UUID(body.job_id))
+        job = (await session.execute(stmt)).scalar_one_or_none()
+        if not job:
+            await engine.dispose()
+            raise HTTPException(status_code=404, detail="Job not found")
+        job.user_email = body.user_email
+        if body.campaign_name:
+            job.campaign_name = body.campaign_name
+        await session.commit()
+
+    await engine.dispose()
+    return {"job_id": body.job_id, "user_email": body.user_email, "campaign_name": body.campaign_name}
+
+
 class RenameRequest(BaseModel):
     name: str
 
