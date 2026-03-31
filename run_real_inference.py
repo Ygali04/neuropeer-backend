@@ -24,6 +24,9 @@ from pathlib import Path
 
 import numpy as np
 
+# Load .env file
+from dotenv import load_dotenv
+load_dotenv("backend/.env")
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://neuropeer:neuropeer@127.0.0.1:5433/neuropeer")
 os.environ.setdefault("S3_ENDPOINT_URL", "http://localhost:9000")
 
@@ -122,16 +125,17 @@ def main():
     avail = client.instances.get_availabilities()
     gpu_candidates = []
     # Priority: preferred type first, then A100s, then H100s, then others
-    gpu_keywords = ["A100", "H100", "H200", "L40", "A6000", "RTX", "V100"]
+    # ONLY allow single-GPU instances (1x prefix) to avoid multi-GPU costs
+    ALLOWED_PREFIXES = ["1A100", "1H100", "1L40", "1A6000", "1RTX", "1V100"]
     for entry in avail:
         loc_code = entry["location_code"] if isinstance(entry, dict) else entry.location_code
         instance_list = entry["availabilities"] if isinstance(entry, dict) else entry.availabilities
         # Preferred type first
         if INSTANCE_TYPE in instance_list:
             gpu_candidates.insert(0, (INSTANCE_TYPE, loc_code))
-        # Then all other GPU types
+        # Then single-GPU types only
         for itype in instance_list:
-            if any(kw in itype for kw in gpu_keywords) and (itype, loc_code) not in gpu_candidates:
+            if any(itype.startswith(p) for p in ALLOWED_PREFIXES) and (itype, loc_code) not in gpu_candidates:
                 gpu_candidates.append((itype, loc_code))
     if not gpu_candidates:
         raise RuntimeError(f"No GPU instances available anywhere. Availabilities: {avail}")
@@ -163,7 +167,7 @@ echo "READY" > /tmp/setup_done
                 hostname=f"neuropeer-{job_id[:8]}",
                 description="NeuroPeer TRIBE v2 inference",
                 location=candidate_loc,
-                is_spot=True,
+                is_spot=False,  # On-demand to avoid spot eviction
                 startup_script_id=script_obj.id,
                 max_wait_time=600,
             )
@@ -198,19 +202,39 @@ echo "READY" > /tmp/setup_done
         else:
             raise RuntimeError("SSH timed out after 5 minutes")
 
-        # ── Step 4: Upload video ─────────────────────────────────────────
-        print(f"\n[4/7] Uploading video to GPU instance...")
-        subprocess.run(
-            ["scp"] + SSH_OPTS + [str(video_path), f"root@{ip_address}:/tmp/video.mp4"],
-            check=True, timeout=60
-        )
-        print(f"  Video uploaded ({video_path.stat().st_size/(1024*1024):.1f} MB)")
+        # ── Step 4: Build events DataFrame + upload to GPU ────────────────
+        print(f"\n[4/7] Building events + uploading to GPU instance...")
+        import re as _re
+        sentences = [s.strip() for s in _re.split(r'[.!?]+', full_text) if s.strip()]
+        events = []
+        events.append({"type": "Video", "filepath": "/tmp/video.mp4", "start": 0,
+            "duration": duration, "timeline": "default", "subject": "default"})
+        events.append({"type": "Audio", "filepath": "/tmp/audio.wav", "start": 0,
+            "duration": duration, "timeline": "default", "subject": "default"})
+        for w in transcript_words:
+            wt = w["word"].strip()
+            if not wt: continue
+            sentence = full_text
+            for s in sentences:
+                if wt.lower() in s.lower(): sentence = s; break
+            events.append({"type": "Word", "text": wt, "start": w["start"],
+                "duration": max(w["end"] - w["start"], 0.01), "timeline": "default",
+                "subject": "default", "sentence": sentence, "context": sentence})
+        import pandas as pd
+        events_df = pd.DataFrame(events)
+        events_parquet = OUT_DIR / "events_for_gpu.parquet"
+        events_df.to_parquet(str(events_parquet), index=False)
+        print(f"  Events: {len(events_df)} rows ({events_df['type'].value_counts().to_dict()})")
 
-        # ── Step 5: Install deps + run inference (single SSH session) ────
-        print(f"\n[5/7] Installing tribev2 + running inference on GPU...")
-        print(f"  This will take ~5-10 min (pip install + model download + 4 inference passes)")
+        for local, remote in [(video_path, "/tmp/video.mp4"), (audio_path, "/tmp/audio.wav"),
+                               (events_parquet, "/tmp/events.parquet")]:
+            subprocess.run(["scp"] + SSH_OPTS + [str(local), f"root@{ip_address}:{remote}"],
+                check=True, timeout=60)
+        print(f"  Files uploaded to GPU instance")
 
-        # Build the full remote script: install deps then run inference
+        # ── Step 5: Install tribev2 + run inference ──────────────────────
+        print(f"\n[5/7] Installing tribev2 + running model.predict() on GPU...")
+        print(f"  (No whisperx needed — events built locally with ElevenLabs)")
         hf_token = os.environ.get("HF_TOKEN", "")
         remote_script = r'''#!/bin/bash
 exec > /tmp/inference.log 2>&1
@@ -220,50 +244,64 @@ echo "=== Creating venv + installing tribev2 ==="
 python3 -m venv /tmp/venv
 source /tmp/venv/bin/activate
 pip install --upgrade pip -q
-pip install git+https://github.com/facebookresearch/tribev2.git 2>&1 | tail -5
+pip install git+https://github.com/facebookresearch/tribev2.git 2>&1 | tail -3
 echo "=== tribev2 installed ==="
 
 echo "=== Running inference ==="
 export HF_TOKEN="''' + hf_token + r'''"
+export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 python3 -u << 'PYEOF'
 import sys, time, logging, json
 import numpy as np
+import pandas as pd
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tribe")
 t0 = time.time()
 
+# Load pre-built events (transcription done locally with ElevenLabs)
+events = pd.read_parquet("/tmp/events.parquet")
+log.info("Events loaded: %d rows, types: %s", len(events), events["type"].value_counts().to_dict())
+
+# Standardize events (tribev2 expects this)
+from neuralset.events.utils import standardize_events
+events = standardize_events(events)
+log.info("Events standardized: %d rows", len(events))
+
+# Load TRIBE v2 model
 log.info("Loading TRIBE v2 model...")
 from tribev2 import TribeModel
 model = TribeModel.from_pretrained("facebook/tribev2", cache_folder="/tmp/tribe_cache")
 log.info("Model loaded in %.1fs", time.time() - t0)
 
-log.info("Generating events from video...")
-t1 = time.time()
-df = model.get_events_dataframe(video_path="/tmp/video.mp4")
-log.info("Events: %d rows in %.1fs", len(df), time.time() - t1)
-
-log.info("Running full multimodal prediction...")
+# Run prediction (events already contain Video + Audio + Word events)
+log.info("Running model.predict()...")
 t2 = time.time()
-preds, segments = model.predict(events=df)
-log.info("Full done in %.1fs: shape=%s", time.time() - t2, preds.shape)
+preds, segments = model.predict(events=events)
+log.info("Full prediction done in %.1fs: shape=%s", time.time() - t2, preds.shape)
 
 results = {"full": preds.astype(np.float32)}
+
+# Ablations: zero out modality columns
 for name in ["video_only", "audio_only", "text_only"]:
     log.info("Ablation: %s", name)
     try:
-        df2 = model.get_events_dataframe(video_path="/tmp/video.mp4")
+        df2 = events.copy()
         if "video" in name:
-            for c in df2.columns:
-                if "audio" in c.lower() or c in ("text","word","sentence","context"): df2[c] = ""
+            mask = df2["type"].isin(["Audio", "Word"])
+            df2 = df2[~mask]
         elif "audio" in name:
-            for c in df2.columns:
-                if "video" in c.lower() or "filepath" in c.lower() or c in ("text","word","sentence","context"): df2[c] = ""
+            mask = df2["type"].isin(["Video", "Word"])
+            df2 = df2[~mask]
         elif "text" in name:
-            for c in df2.columns:
-                if "video" in c.lower() or "filepath" in c.lower() or "audio" in c.lower(): df2[c] = ""
-        p, _ = model.predict(events=df2)
-        results[name] = p.astype(np.float32)
-        log.info("  %s: shape=%s", name, p.shape)
+            mask = df2["type"].isin(["Video", "Audio"])
+            df2 = df2[~mask]
+        if len(df2) > 0:
+            p, _ = model.predict(events=df2)
+            results[name] = p.astype(np.float32)
+            log.info("  %s: shape=%s", name, p.shape)
+        else:
+            log.warning("  %s: no events remain, using full", name)
+            results[name] = results["full"].copy()
     except Exception as e:
         log.warning("  %s failed: %s", name, e)
         results[name] = results["full"].copy()

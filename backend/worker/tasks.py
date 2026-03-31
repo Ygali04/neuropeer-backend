@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import tempfile
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -72,8 +73,75 @@ def _save_to_s3(data: bytes, key: str) -> str:
     return key
 
 
+def _persist_to_db(job_id, url, content_type, duration, neural_score, metrics_data, key_moments, modality_breakdown, vertex_key, timeseries_key, ai_feedback=None, parent_job_id=None, content_group_id=None, campaign_name=None, user_email=None):
+    """Write Job + Result rows to PostgreSQL for permanent storage."""
+    import asyncio
+    from datetime import UTC, datetime
+    from uuid import UUID
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from backend.models.db import Job, Result
+
+    async def _write():
+        engine = create_async_engine(settings.database_url)
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        async with Session() as session:
+            # Update or create Job row
+            from sqlalchemy import select
+            stmt = select(Job).where(Job.id == UUID(job_id))
+            existing = (await session.execute(stmt)).scalar_one_or_none()
+            if existing:
+                existing.status = "complete"
+                existing.completed_at = datetime.now(UTC).replace(tzinfo=None)
+            else:
+                session.add(Job(
+                    id=UUID(job_id), url=url, content_type=content_type,
+                    status="complete",
+                    created_at=datetime.now(UTC).replace(tzinfo=None),
+                    completed_at=datetime.now(UTC).replace(tzinfo=None),
+                    parent_job_id=UUID(parent_job_id) if parent_job_id else None,
+                    content_group_id=UUID(content_group_id) if content_group_id else uuid.uuid4(),
+                    campaign_name=campaign_name,
+                    user_email=user_email,
+                ))
+                await session.flush()
+
+            # Create Result row
+            session.add(Result(
+                job_id=UUID(job_id), duration_seconds=duration,
+                neural_score_total=neural_score.total,
+                hook_score=neural_score.hook_score,
+                sustained_attention=neural_score.sustained_attention,
+                emotional_resonance=neural_score.emotional_resonance,
+                memory_encoding=neural_score.memory_encoding,
+                aesthetic_quality=neural_score.aesthetic_quality,
+                cognitive_accessibility=neural_score.cognitive_accessibility,
+                timeseries_s3_key=timeseries_key,
+                vertex_data_s3_key=vertex_key,
+                metrics_json=metrics_data,
+                key_moments_json=[km.model_dump() for km in key_moments],
+                modality_json=[mb.model_dump() for mb in modality_breakdown],
+                overarching_summary=ai_feedback.get("summary") if ai_feedback else None,
+                ai_summary=ai_feedback.get("summary") if ai_feedback else None,
+                ai_report_title=ai_feedback.get("report_title") if ai_feedback else None,
+                ai_action_items=ai_feedback.get("action_items") if ai_feedback else None,
+                ai_priorities=ai_feedback.get("priorities") if ai_feedback else None,
+                ai_category_strategies=ai_feedback.get("category_strategies") if ai_feedback else None,
+                ai_metric_tips=ai_feedback.get("metric_tips") if ai_feedback else None,
+            ))
+            await session.commit()
+        await engine.dispose()
+
+    try:
+        asyncio.run(_write())
+        logger.info("Persisted job %s to PostgreSQL", job_id)
+    except Exception as exc:
+        logger.warning("Failed to persist to DB (non-fatal): %s", exc)
+
+
 @celery_app.task(name="neuropeer.analyze", bind=True, max_retries=1)
-def run_analysis(self, job_id: str, url: str, content_type: str) -> dict:
+def run_analysis(self, job_id: str, url: str, content_type: str, parent_job_id: str | None = None, user_email: str | None = None) -> dict:
     """
     Full NeuroPeer analysis pipeline for a single video URL.
     Streams progress events at each stage.
@@ -91,6 +159,16 @@ def run_analysis(self, job_id: str, url: str, content_type: str) -> dict:
     from backend.pipeline.metric_engine import compute_all_metrics
     from backend.pipeline.neural_score import compute_neural_score, detect_key_moments
     from backend.pipeline.remote_gpu import run_inference_backend
+
+    # Resolve content_group_id from parent or generate new
+    content_group_id = None
+    if parent_job_id:
+        raw_parent = _get_redis().get(f"neuropeer:result:{parent_job_id}")
+        if raw_parent:
+            parent_data = json.loads(raw_parent)
+            content_group_id = parent_data.get("content_group_id")
+    if not content_group_id:
+        content_group_id = str(uuid.uuid4())
 
     work_dir = Path(tempfile.mkdtemp(prefix=f"neuropeer_{job_id}_", dir=settings.temp_dir))
 
@@ -116,8 +194,33 @@ def run_analysis(self, job_id: str, url: str, content_type: str) -> dict:
         _publish_progress(job_id, "inferring", 0.25, _inference_start_msg())
         _update_job_status(job_id, "inferring")
 
+        # Build TRIBE v2-compatible events DataFrame for DataCrunch
+        # (Video + Audio + Word events with sentence/context fields)
+        import re as _re
+        import pandas as _pd
+        full_text = " ".join(w["word"] for w in media.transcript_words)
+        sentences = [s.strip() for s in _re.split(r'[.!?]+', full_text) if s.strip()]
+        tribe_events = []
+        tribe_events.append({"type": "Video", "filepath": str(media.video_path), "start": 0,
+            "duration": media.duration_seconds, "timeline": "default", "subject": "default"})
+        tribe_events.append({"type": "Audio", "filepath": str(media.audio_path), "start": 0,
+            "duration": media.duration_seconds, "timeline": "default", "subject": "default"})
+        for w in media.transcript_words:
+            wt = w["word"].strip()
+            if not wt:
+                continue
+            sentence = full_text
+            for s in sentences:
+                if wt.lower() in s.lower():
+                    sentence = s
+                    break
+            tribe_events.append({"type": "Word", "text": wt, "start": w["start"],
+                "duration": max(w["end"] - w["start"], 0.01), "timeline": "default",
+                "subject": "default", "sentence": sentence, "context": sentence})
+        tribe_events_df = _pd.DataFrame(tribe_events)
+
         predictions, vertex_key = run_inference_backend(
-            job_id, events_df, work_dir, video_path=media.video_path
+            job_id, tribe_events_df, work_dir, video_path=media.video_path
         )
 
         _publish_progress(job_id, "inferring", 0.65, "All 4 modality passes complete.")
@@ -138,25 +241,70 @@ def run_analysis(self, job_id: str, url: str, content_type: str) -> dict:
         neural_score = compute_neural_score(metrics, content_type_enum)
         key_moments = detect_key_moments(attn_curve, arousal_curve, cog_curve, predictions[Modality.FULL])
 
-        # Save timeseries to S3
+        # ── Stage 5: AI Feedback generation ───────────────────────────────
+        _publish_progress(job_id, "scoring", 0.88, "Generating AI improvement strategies…")
+
+        from backend.pipeline.ai_feedback import generate_ai_feedback
+
+        _ai_input = {
+            "content_type": content_type,
+            "duration_seconds": media.duration_seconds,
+            "neural_score": neural_score.model_dump(),
+            "metrics": [m.model_dump() for m in metrics],
+            "key_moments": [km.model_dump() for km in key_moments],
+        }
+
+        parent_result_data = None
+        if parent_job_id:
+            raw_parent = _get_redis().get(f"neuropeer:result:{parent_job_id}")
+            if raw_parent:
+                parent_result_data = json.loads(raw_parent)
+
+        ai_feedback = generate_ai_feedback(_ai_input, parent_result_data)
+
+        # ── Stage 6: Campaign naming (first video in group only) ──────────
+        campaign_name = None
+        if not parent_job_id:
+            from backend.pipeline.campaign_naming import generate_campaign_name
+            campaign_name = generate_campaign_name(url, content_type, ai_feedback.get("summary", ""))
+
+        # ── Upload ALL artifacts to S3 ─────────────────────────────────────
+        _publish_progress(job_id, "scoring", 0.90, "Uploading artifacts to S3…")
+
+        # Timeseries
         ts_buffer = io.BytesIO()
-        np.savez_compressed(
-            ts_buffer,
-            attention=attn_curve,
-            arousal=arousal_curve,
-            cognitive_load=cog_curve,
-        )
-        timeseries_key = f"predictions/{job_id}/timeseries.npz"
+        np.savez_compressed(ts_buffer, attention=attn_curve, arousal=arousal_curve, cognitive_load=cog_curve)
+        timeseries_key = f"jobs/{job_id}/timeseries.npz"
         _save_to_s3(ts_buffer.getvalue(), timeseries_key)
 
-        # Build final result dict using Pydantic model_dump()
+        # Video file
+        video_key = f"jobs/{job_id}/video{media.video_path.suffix}"
+        _save_to_s3(media.video_path.read_bytes(), video_key)
+
+        # Audio file
+        audio_key = f"jobs/{job_id}/audio.wav"
+        _save_to_s3(media.audio_path.read_bytes(), audio_key)
+
+        # Transcript
+        transcript_key = f"jobs/{job_id}/transcript.json"
+        _save_to_s3(json.dumps({"words": media.transcript_words, "text": " ".join(w["word"] for w in media.transcript_words)}).encode(), transcript_key)
+
+        # Metrics + Neural Score
+        metrics_data = [m.model_dump() for m in metrics]
+        _save_to_s3(json.dumps(metrics_data, indent=2).encode(), f"jobs/{job_id}/metrics.json")
+        _save_to_s3(json.dumps(neural_score.model_dump(), indent=2).encode(), f"jobs/{job_id}/neural_score.json")
+        _save_to_s3(json.dumps([km.model_dump() for km in key_moments], indent=2).encode(), f"jobs/{job_id}/key_moments.json")
+
+        logger.info("All artifacts uploaded to S3 for job %s", job_id)
+
+        # ── Build result + store in Redis + PostgreSQL ────────────────────
         result = {
             "job_id": job_id,
             "url": url,
             "content_type": content_type,
             "duration_seconds": media.duration_seconds,
             "neural_score": neural_score.model_dump(),
-            "metrics": [m.model_dump() for m in metrics],
+            "metrics": metrics_data,
             "attention_curve": attn_curve.tolist(),
             "emotional_arousal_curve": arousal_curve.tolist(),
             "cognitive_load_curve": cog_curve.tolist(),
@@ -164,13 +312,30 @@ def run_analysis(self, job_id: str, url: str, content_type: str) -> dict:
             "modality_breakdown": [mb.model_dump() for mb in modality_breakdown],
             "vertex_data_s3_key": vertex_key,
             "timeseries_s3_key": timeseries_key,
+            "overarching_summary": ai_feedback.get("summary", ""),
+            "ai_summary": ai_feedback.get("summary", ""),
+            "ai_report_title": ai_feedback.get("report_title", ""),
+            "ai_action_items": ai_feedback.get("action_items", []),
+            "ai_priorities": ai_feedback.get("priorities", []),
+            "ai_category_strategies": ai_feedback.get("category_strategies", {}),
+            "ai_metric_tips": ai_feedback.get("metric_tips", {}),
+            "parent_job_id": parent_job_id,
+            "content_group_id": content_group_id,
+            "campaign_name": campaign_name,
+            "user_email": user_email,
         }
 
-        _get_redis().set(
-            f"neuropeer:result:{job_id}",
-            json.dumps(result),
-            ex=60 * 60 * 24 * 7,
-        )
+        # Redis cache (7 day TTL)
+        _get_redis().set(f"neuropeer:result:{job_id}", json.dumps(result), ex=60 * 60 * 24 * 7)
+
+        # Persist to PostgreSQL (permanent)
+        _persist_to_db(job_id, url, content_type, media.duration_seconds, neural_score, metrics_data, key_moments, modality_breakdown, vertex_key, timeseries_key, ai_feedback=ai_feedback, parent_job_id=parent_job_id, content_group_id=content_group_id, campaign_name=campaign_name, user_email=user_email)
+
+        # ── Update marketer profile ───────────────────────────────────────
+        if user_email:
+            from backend.pipeline.marketer_profile import update_marketer_profile
+            update_marketer_profile(user_email)
+
         _update_job_status(job_id, "complete")
         _publish_progress(job_id, "complete", 1.0, "Analysis complete!")
         return result

@@ -722,41 +722,73 @@ def get_video_duration(video_path: Path) -> tuple[float, float]:
 
 def transcribe_audio(audio_path: Path) -> list[dict]:
     """
-    Transcribe audio using ElevenLabs Scribe v2 with word-level timestamps.
+    Transcribe audio with word-level timestamps.
+    Tries ElevenLabs Scribe v2 first, falls back to faster-whisper (local CPU).
     Returns list of {"word": str, "start": float, "end": float}.
     """
-    from elevenlabs.client import ElevenLabs
+    # Try ElevenLabs first (faster, better quality)
+    if settings.elevenlabs_api_key:
+        try:
+            return _transcribe_elevenlabs(audio_path)
+        except Exception as exc:
+            logger.warning("ElevenLabs STT failed, falling back to faster-whisper: %s", exc)
 
-    if not settings.elevenlabs_api_key:
-        raise RuntimeError(
-            "ELEVENLABS_API_KEY is required for transcription. Get one at https://elevenlabs.io/app/settings/api-keys"
-        )
+    # Fallback: faster-whisper on CPU (works everywhere, no API needed)
+    return _transcribe_whisper(audio_path)
 
-    client = ElevenLabs(api_key=settings.elevenlabs_api_key)
+
+def _transcribe_elevenlabs(audio_path: Path) -> list[dict]:
+    """ElevenLabs Scribe v2 transcription."""
+    import httpx
+
     logger.info("Transcribing with ElevenLabs Scribe v2: %s", audio_path.name)
-
     with open(audio_path, "rb") as f:
-        result = client.speech_to_text.convert(
-            file=f,
-            model_id="scribe_v2",
-            tag_audio_events=False,
-            timestamps_granularity="word",
+        response = httpx.post(
+            "https://api.elevenlabs.io/v1/speech-to-text",
+            headers={"xi-api-key": settings.elevenlabs_api_key},
+            data={"model_id": "scribe_v2", "tag_audio_events": "false", "timestamps_granularity": "word"},
+            files={"file": (audio_path.name, f, "audio/wav")},
+            timeout=120,
         )
 
+    if response.status_code != 200:
+        raise RuntimeError(f"ElevenLabs error {response.status_code}: {response.text[:200]}")
+
+    result = response.json()
     words = []
-    for chunk in result.words:
-        text = chunk.text.strip()
+    for chunk in result.get("words", []):
+        text = (chunk.get("text") or "").strip()
         if not text:
             continue
         words.append(
             {
                 "word": text,
-                "start": chunk.start,
-                "end": chunk.end,
+                "start": chunk.get("start", 0),
+                "end": chunk.get("end", 0),
             }
         )
 
-    logger.info("Transcription complete: %d words", len(words))
+    logger.info("ElevenLabs transcription complete: %d words", len(words))
+    return words
+
+
+def _transcribe_whisper(audio_path: Path) -> list[dict]:
+    """Fallback: faster-whisper on CPU. Works on any server, no API key needed."""
+    from faster_whisper import WhisperModel
+
+    logger.info("Transcribing with faster-whisper (CPU fallback): %s", audio_path.name)
+    model = WhisperModel("base", device="cpu", compute_type="int8")
+    segments, _ = model.transcribe(str(audio_path), word_timestamps=True)
+
+    words = []
+    for segment in segments:
+        if segment.words:
+            for w in segment.words:
+                text = w.word.strip()
+                if text:
+                    words.append({"word": text, "start": w.start, "end": w.end})
+
+    logger.info("Whisper transcription complete: %d words", len(words))
     return words
 
 
